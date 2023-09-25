@@ -1,0 +1,350 @@
+---
+title: "RNA-seq analysis of rat"
+author: "Martin Převorovský, prevorov@natur.cuni.cz, http://www.GenoMik.cz"
+output: html_document
+---
+
+Samples:
+
+Wistar rats. 
+Isolated gamma delta T lymphocytes from rat spleen.
+
+Samples 1_K, 2_K and 4_K are from control rats (K) kept at room temperature
+Samples 5_1D, 7_1D and 8_1D are from rats that were adapted to cold for 1 day (1D)
+Samples 9_14D, 10_14D and 11_14D are from rats that were adapted to cold for 14 days (14D)
+
+The aims are to:
+
+Gamma delta lymphocytes play a role in cold adaptation. During cold adaptation, their content increases in various tissues (blood, spleen, peritoneal cavity,...). We want to find out if newly produced gdT lymphocytes are special in any way (immune genes, genes related to cold adaptation, metabolism).
+
+
+```{r setup, message=FALSE}
+library(rtracklayer)
+library(GenomicAlignments)
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+genome_dir <- './genome_rat/'
+genome_gff <- paste0(genome_dir, 'GCF_015227675.2_mRatBN7.2_genomic.gff.gz')
+bam_dir <- './BAM_RNA-seq_rat/'
+coverage_dir <- './coverage_RNA-seq_rat/'
+image_dir <- './images_rat/'
+deg_dir <- './DEG_RNA-seq_rat/'
+```
+
+Variables for shell scripts are stored in the file "shell_variables_RNA-seq_rat.sh" and can be modified as needed:
+
+```{bash list_variables}
+cat shell_variables_RNA-seq_rat.sh
+```
+
+
+## Get the raw RNA-seq read datasets
+
+
+## Get rat genome sequence and annotation
+
+* mRatBN7.2 assembly from RefSeq
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+mkdir -p "${genome_dir}"
+wget -N --no-verbose  --directory-prefix="${genome_dir}" https://ftp.ncbi.nih.gov/genomes/refseq/vertebrate_mammalian/Rattus_norvegicus/latest_assembly_versions/GCF_015227675.2_mRatBN7.2/GCF_015227675.2_mRatBN7.2_genomic.fna.gz
+gzip -fd "${genome_dir}GCF_015227675.2_mRatBN7.2_genomic.fna.gz"
+
+wget -N --no-verbose  --directory-prefix="${genome_dir}" https://ftp.ncbi.nih.gov/genomes/refseq/vertebrate_mammalian/Rattus_norvegicus/latest_assembly_versions/GCF_015227675.2_mRatBN7.2/GCF_015227675.2_mRatBN7.2_genomic.gff.gz
+
+samtools faidx "${genome}"
+cut -f1,2 "${genome}.fai" > "${genome_dir}chrom.sizes"
+```
+
+
+## QC of raw sequence reads
+
+Technical quality of library construction and sequencing run was tested using fastQC
+
+```{bash}
+fastqc --version
+multiqc --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+mkdir -p "${QC_dir}"
+mapfile -t fastq_files < <(ls -1 -d "${fastq_dir}"* | grep "${fastq_file_ext}")
+fastqc --quiet --outdir "${QC_dir}" --threads "${CPU}" "${fastq_files[@]}"
+multiqc -f -m fastqc -i RNA-seq_rat -o "${QC_dir}" "${QC_dir}"
+```
+
+Results of QC:
+
+* 100 nt PE reads
+
+* ~34-36M read pairs per sample
+
+* read quality scores deteriorate towards the 3' end (only read2). Trimming is needed.
+
+* all files give error on per base sequence content (mostly positions 1-13) (normal for random-primed cDNA)
+
+* 9 files give warning on per sequence GC content (not sure why; the profiles look very similar for all files)
+
+* all files give error on high read duplication levels
+
+* adapter contamination ~1% (Nextera transposase sequence). Will be trimmed.
+
+
+## Read trimming
+
+* remove Nextera adapters
+
+* trim parts of the reads where average base quality in a 4 nt window drops below 20
+
+* only keep trimmed reads that are at least 20 nt long
+
+```{bash}
+java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar -version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+mkdir -p "${fastq_trim_dir}"
+fastq_files_1=( $(ls -1 "${fastq_dir}" | grep "_1${fastq_file_ext}") )
+fastq_files_2=( $(ls -1 "${fastq_dir}" | grep "_2${fastq_file_ext}") )
+for i in ${!fastq_files_1[@]};
+do
+  java -jar /opt/Trimmomatic-0.39/trimmomatic-0.39.jar PE -phred33 -threads "${CPU}" "${fastq_dir}${fastq_files_1[${i}]}" "${fastq_dir}${fastq_files_2[${i}]}" "${fastq_trim_dir}${fastq_files_1[${i}]}.trim.txt.gz" /dev/null "${fastq_trim_dir}${fastq_files_2[${i}]}.trim.txt.gz" /dev/null ILLUMINACLIP:/opt/Trimmomatic-0.39/adapters/NexteraPE-PE.fa:2:30:10:2:True SLIDINGWINDOW:4:20 MINLEN:20
+done
+```
+
+Dropped <1% of reads.
+
+
+## QC of quality-trimmed sequence reads
+
+Effects of trimming were determined by `fastQC`.
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+mkdir -p "${QC_trim_dir}"
+mapfile -t fastq_files < <(ls -1 -d "${fastq_trim_dir}"* | grep "trim.txt.gz")
+fastqc --quiet --outdir "${QC_trim_dir}" --threads "${CPU}" "${fastq_files[@]}"
+multiqc -f -m fastqc -i RNA-seq_trimmed_rat -o "${QC_trim_dir}" "${QC_trim_dir}"
+```
+
+Results of QC:
+
+* adapters were removed
+
+* 20-100 nt reads (vast majority of reads are >97 nt)
+
+* read quality scores now OK
+
+
+# Read mapping into the rat genome
+
+```{bash}
+hisat2 --version | head -n 1
+samtools --version | head -n 2
+```
+  
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+# build HISAT2 index
+hisat2-build --quiet -p "${CPU}" "${genome}" "${genome}"
+
+# map
+mkdir -p "${bam_dir}"
+fastq_files_1=( $(ls -1 "${fastq_trim_dir}" | grep "_1\..*\.gz$") )
+fastq_files_2=( $(ls -1 "${fastq_trim_dir}" | grep "_2\..*\.gz$") )
+for i in ${!fastq_files_1[@]};
+do
+	infile1="${fastq_trim_dir}${fastq_files_1[${i}]}"
+	infile2="${fastq_trim_dir}${fastq_files_2[${i}]}"
+	outfile="${bam_dir}${fastq_files_1[${i}]}.bam"
+  echo "${outfile}"
+	hisat2 -x "${genome}" -1 "${infile1}" -2 "${infile2}" --threads "${CPU}" -k 15 --summary-file "${outfile}.log" | samtools view -b -F 256 --threads "${CPU}" - | samtools sort --threads "${CPU}" -o "${outfile}" -
+	samtools index -@ "${CPU}" "${outfile}"
+	samtools view -c --threads "${CPU}" "${outfile}"
+done
+```
+
+Notes
+
+* Mapping rates were >97%.
+
+
+## Calculate genome coverage tracks
+
+```{bash}
+deeptools --version
+```
+
+```{bash, eval=TRUE}
+source shell_variables_RNA-seq_rat.sh
+
+mkdir -p "${coverage_dir}"
+mapfile -t bam_files < <(ls -1 "${bam_dir}" | grep "\.bam$")
+for i in ${!bam_files[@]};
+do
+	input_file="${bam_dir}${bam_files[${i}]}"
+	bamCoverage --binSize "${bin_size}" --normalizeUsing CPM -p "${CPU}" --bam "${input_file}" -o "${coverage_dir}${bam_files[${i}]}.bw"
+done
+
+# average coverage tracks across biological replicates
+mapfile -t bw_files < <(ls -1 "${coverage_dir}" | grep "\.bam\.bw$" | sort -V)
+samples=("control" "1_day" "14_days")
+for i in {0..2};
+do
+  wiggletools mean "${coverage_dir}${bw_files[${i}*3]}" "${coverage_dir}${bw_files[${i}*3+1]}" "${coverage_dir}${bw_files[${i}*3+2]}" | wigToBigWig stdin "${genome_dir}chrom.sizes" "${coverage_dir}${samples[${i}]}.mean.bw"
+done
+```
+
+
+## Generate gene-level counts tables.
+
+```{r, eval=TRUE}
+library(BiocParallel)
+register(MulticoreParam(workers = 2)) # parallel processing reduced to avoid memory depletion and crashing
+
+dir.create(coverage_dir, recursive = TRUE)
+
+gff <- import.gff3(genome_gff)
+gff.genes <- gff[gff$type == 'gene', ]
+rm(gff)
+
+sample_info <- read.delim('sampleInfo_rat', stringsAsFactors = FALSE, header = TRUE, sep = '\t')
+sample_info[, 'cold_time'] <- factor(sample_info[, 'cold_time'])
+
+bam <- BamFileList(sample_info$bam_file,
+                    asMates = TRUE,
+                    yieldSize = 1000000)
+names(bam) <- sample_info$sample_ID
+se <- summarizeOverlaps(gff.genes,
+                         bam,
+                         mode = 'Union',
+                         singleEnd = FALSE,
+                         fragments = FALSE,
+                         ignore.strand = FALSE,
+                         preprocess.reads = invertStrand)
+
+rownames(se) <- gff.genes$ID
+colData(se) <- cbind(colData(se), sample_info)
+save(se, file = 'se_rat.rda')
+#load(file = 'se_rat.rda')
+
+counts <- assay(se)
+
+# normalize to get TPM values (transcripts per million)
+gene_widths <- width(gff.genes)
+counts.norm <- counts
+for (i in 1:nrow(counts.norm)){
+  counts.norm[i, ] <- counts.norm[i, ] / gene_widths[i]
+}
+count_sums <- colSums(counts.norm) / 1000000
+for (i in 1:length(count_sums)){
+  counts.norm[, i] <- counts.norm[, i] / count_sums[i]
+}
+
+counts <- cbind(gff.genes$Name, counts)
+counts.norm <- cbind(gff.genes$Name, counts.norm)
+colnames(counts)[1] <- 'gene_name'
+colnames(counts.norm)[1] <- 'gene_name'
+write.csv(counts, file = paste0(coverage_dir, 'counts_rat.csv'), quote = FALSE)
+write.csv(counts.norm, file = paste0(coverage_dir, 'counts_rat.TPM-normalized.csv'), quote = FALSE)
+rm(gene_widths, count_sums)
+```
+
+
+## QC of count table data
+
+```{r, eval=TRUE}
+dir.create(image_dir)
+load('se_rat.rda')
+
+dds <- DESeqDataSet(se, design = ~ cold_time)
+dds <- DESeq(dds)
+rld <- rlog(dds, blind = FALSE)
+
+sampleDists <- dist(t(assay(rld)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- rld$sample_ID
+#colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")))(255)
+pdf(paste0(image_dir, 'heatmap_RNA-seq_sampleDist_rlog.pdf'))
+pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+dev.off()
+
+pdf(paste0(image_dir, 'PCA_RNA-seq_rlog.pdf'))
+plotPCA(rld, intgroup = c('sample_ID'))
+plotPCA(rld, intgroup = c('cold_time'))
+dev.off()
+```
+
+* Heatmap results - samples do not cluster by treatment at all.
+
+* PCA results - samples do not cluster by treatment at all.
+
+
+## DEG calling
+
+```{r, eval=TRUE}
+# Benjamini-Hochberg p value adjustment (FDR)
+padj_threshold <- 0.05
+
+dir.create(deg_dir)
+
+dds <- DESeqDataSet(se, design = ~ cold_time)
+dds$mitochondria_received <- relevel(dds$cold_time, ref = "0")
+dds <- DESeq(dds)
+
+# 1 day vs control
+res <- results(dds, alpha = padj_threshold, contrast = c("cold_time", "1", "0"))
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_rat_1day_vs_control.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_rat_1day_vs_control.SIG.csv'), quote = FALSE)
+
+# 14 days vs control
+res <- results(dds, alpha = padj_threshold, contrast = c("cold_time", "14", "0"))
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_rat_14days_vs_control.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_rat_14days_vs_control.SIG.csv'), quote = FALSE)
+
+# 14 days vs 1 day
+dds <- DESeqDataSet(se, design = ~ cold_time)
+dds$mitochondria_received <- relevel(dds$cold_time, ref = "1")
+dds <- DESeq(dds)
+
+res <- results(dds, alpha = padj_threshold, contrast = c("cold_time", "14", "1"))
+summary(res[res$padj <= padj_threshold & !is.na(res$padj), ])
+res <- cbind(counts[, 'gene_name'], res)
+colnames(res)[1] <- 'gene_name'
+write.csv(res, file = paste0(deg_dir, 'DESeq2results_rat_14days_vs_1day.csv'), quote = FALSE)
+res.sig <- res[which(res$padj <= padj_threshold), ]
+res.sig <- res.sig[order(res.sig$log2FoldChange), ]
+write.csv(res.sig, file = paste0(deg_dir, 'DESeq2results_rat_14days_vs_1day.SIG.csv'), quote = FALSE)
+```
+
+***
+
+```{r}
+sessionInfo()
+```

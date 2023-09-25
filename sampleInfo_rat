@@ -1,0 +1,11 @@
+sample_ID	bam_file	cold_time
+1_K	./BAM_RNA-seq_rat/1_K_1.fq.gz.trim.txt.gz.bam	0
+10_14D	./BAM_RNA-seq_rat/10_14D_1.fq.gz.trim.txt.gz.bam	14
+11_14D	./BAM_RNA-seq_rat/11_14D_1.fq.gz.trim.txt.gz.bam	14
+2_K	./BAM_RNA-seq_rat/2_K_1.fq.gz.trim.txt.gz.bam	0
+4_K	./BAM_RNA-seq_rat/4_K_1.fq.gz.trim.txt.gz.bam	0
+5_1D	./BAM_RNA-seq_rat/5_1D_1.fq.gz.trim.txt.gz.bam	1
+7_1D	./BAM_RNA-seq_rat/7_1D_1.fq.gz.trim.txt.gz.bam	1
+8_1D	./BAM_RNA-seq_rat/8_1D_1.fq.gz.trim.txt.gz.bam	1
+9_14D	./BAM_RNA-seq_rat/9_14D_1.fq.gz.trim.txt.gz.bam	14
+
